@@ -1,0 +1,110 @@
+pipeline {
+    agent { label 'aws-node' }
+
+    environment {
+        AWS_ACCESS_KEY_ID = credentials('aws-access-key-id')
+        AWS_SECRET_ACCESS_KEY = credentials('aws-secret-access-key')
+        AWS_REGION = 'us-east-1'
+    }
+
+    parameters {
+        choice(name: 'EC2_INSTANCE_TYPE', choices: ['t2.micro', 't3.medium', 't3.large', 'm5.large'], description: 'Select EC2 Instance Type')
+        choice(name: 'STORAGE_SIZE', choices: ['10', '20', '50', '100'], description: 'Select storage size in GB')
+        string(name: 'SECURITY_GROUP_NAME', defaultValue: 'my-security-group', description: 'Enter a name for the EC2 Security Group')
+        string(name: 'SECURITY_GROUP_PORTS', defaultValue: '22,80,443', description: 'Comma-separated list of ports to allow in security group')
+        string(name: 'MY_EC2_KEY_PAIR', defaultValue: 'my-ec2-key-pair', description: 'Enter a name for the EC2 Key Pair')
+        string(name: 'INSTANCE_NAME', defaultValue: 'test', description: 'Enter a name of instance')
+        choice(name: 'AMI_ID', choices: ['ami-0866a3c8686eaeeba', 'ami-0453ec754f44f9a4a'], description: 'Select an AMI ID for EC2 Instance')
+    }
+
+    stages {
+        stage('AWS CLI Login') {
+            steps {
+                script {
+                    sh 'aws configure set aws_access_key_id ${AWS_ACCESS_KEY_ID}'
+                    sh 'aws configure set aws_secret_access_key ${AWS_SECRET_ACCESS_KEY}'
+                    sh 'aws configure set region ${AWS_REGION}'
+                }
+            }
+        }
+
+        stage('Create EC2 Key Pair') {
+            steps {
+            script {
+            def keyPairName = params.MY_EC2_KEY_PAIR
+            def privateKeyFile = "/home/telematrix/${keyPairName}.pem"
+
+            if (fileExists(privateKeyFile)) {
+                echo "Private key already exists at ${privateKeyFile}, skipping creation."
+            } else {
+                sh """
+                aws ec2 create-key-pair --key-name ${keyPairName} --query 'KeyMaterial' --output text > ${privateKeyFile}
+                """
+                
+                echo "Key pair ${keyPairName} created. Private key saved to ${privateKeyFile}"
+
+                sh "chmod 400 ${privateKeyFile}"
+            }
+
+        }
+    }
+        }
+
+        stage('Create Security Group') {
+        steps {
+        script {
+            def securityGroupName = params.SECURITY_GROUP_NAME
+            def ports = params.SECURITY_GROUP_PORTS
+
+            sh """
+            # Create the security group
+            aws ec2 create-security-group --group-name ${securityGroupName} --description "Security group for EC2" --output json
+            
+            # Fetch the Security Group ID
+            SECURITY_GROUP_ID=\$(aws ec2 describe-security-groups --filters Name=group-name,Values=${securityGroupName} --query "SecurityGroups[0].GroupId" --output text)
+            
+            # Authorize the ingress rules (ports)
+            for port in \$(echo ${ports} | tr "," "\n")
+            do
+                aws ec2 authorize-security-group-ingress --group-id \$SECURITY_GROUP_ID --protocol tcp --port \$port --cidr 0.0.0.0/0
+            done
+            """
+            
+            echo "Security group ${securityGroupName} created with ID: \$SECURITY_GROUP_ID"
+        }
+    }
+}
+
+stage('Create EC2 Instance') {
+    steps {
+        script {
+            def instanceType = params.EC2_INSTANCE_TYPE
+            def storageSize = params.STORAGE_SIZE
+            def amiId = params.AMI_ID
+            def keyPairName = params.MY_EC2_KEY_PAIR
+            def securityGroupName = params.SECURITY_GROUP_NAME
+            def instanceName = params.INSTANCE_NAME
+
+            sh """
+            INSTANCE_ID=\$(aws ec2 run-instances --image-id ${amiId} --count 1 --instance-type ${instanceType} --security-group-ids ${securityGroupName} --key-name ${keyPairName} --block-device-mappings DeviceName=/dev/sda1,Ebs={VolumeSize=${storageSize}} --query "Instances[0].InstanceId" --output text)
+
+            # Tag the instance with the specified name
+            aws ec2 create-tags --resources \$INSTANCE_ID --tags Key=Name,Value=${instanceName}
+
+            echo "EC2 Instance created with Instance ID: \$INSTANCE_ID and Name: ${instanceName}"
+            """
+        }
+    }
+}
+
+}
+    post {
+        success {
+            echo 'Resources created successfully on AWS.'
+        }
+
+        failure {
+            echo 'There was an error during the execution.'
+        }
+    }
+}
